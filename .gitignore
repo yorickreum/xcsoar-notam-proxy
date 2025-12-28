@@ -1,0 +1,5 @@
+# Local-only config
+.vscode/sftp.json
+.env
+.htaccess
+.DS_Store
