@@ -3,3 +3,4 @@
 .env
 .htaccess
 .DS_Store
+tmp/

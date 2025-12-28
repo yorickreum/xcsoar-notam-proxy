@@ -5,17 +5,29 @@
 //
 // Original author: Markus Sachs, ms@squawk-vfr.de
 // Written for Enroute Flight Navigation, Jan 2024.
+// From: https://github.com/Akaflieg-Freiburg/enrouteProxy/
 // Adapted for XCSoar by Yorick Reum, December 2025.
 //
 // Data source information:
 // https://www.faa.gov/
 //
-// Usage: [server]/notams.php?locationLongitude=a&locationLatitude=b&locationRadius=c
-// with
-// a = longitude of the search center (decimal point)
-// b = latitude of the search center (decimal point)
-// c = search radius [units?]
-// Optional: append &pageSize=d; default is 1000.
+// Might be possible to also add
+// https://applications.icao.int/dataservices/default.aspx
+// as a data source in the future.
+//
+// Usage (GET):
+//   /notam.php?locationLongitude=a&locationLatitude=b&locationRadius=c
+//   Aliases: lon/lat/radius
+// Required:
+//   a = longitude of the search center (decimal point)
+//   b = latitude of the search center (decimal point)
+//   c = search radius [units?]
+// Optional:
+//   pageSize=d (default and max 1000)
+//
+// Delta mode (POST JSON):
+//   {"known": {"NOTAM_ID": "lastUpdated", "NOTAM_ID_2": "lastUpdated"}}
+// Response includes only new/changed items plus "removedIds".
 
 // Function to get database connection
 function getDbConnection() {
@@ -221,12 +233,60 @@ try {
 
     // Input validation and sanitization
     $longitude = filter_input(INPUT_GET, 'locationLongitude', FILTER_VALIDATE_FLOAT);
+    if ($longitude === null || $longitude === false) {
+        $longitude = filter_input(INPUT_GET, 'lon', FILTER_VALIDATE_FLOAT);
+    }
     $latitude = filter_input(INPUT_GET, 'locationLatitude', FILTER_VALIDATE_FLOAT);
+    if ($latitude === null || $latitude === false) {
+        $latitude = filter_input(INPUT_GET, 'lat', FILTER_VALIDATE_FLOAT);
+    }
     $radius = filter_input(INPUT_GET, 'locationRadius', FILTER_VALIDATE_INT);
+    if ($radius === null || $radius === false) {
+        $radius = filter_input(INPUT_GET, 'radius', FILTER_VALIDATE_INT);
+    }
     $pageSize = filter_input(INPUT_GET, 'pageSize', FILTER_VALIDATE_INT) ?: 1000;
 
     if (!isset($latitude) || !isset($longitude) || !$radius || !isValidLongitude($longitude) || !isValidLatitude($latitude) || !isValidRadius($radius) || !isValidPageSize($pageSize)) {
       throw new InvalidArgumentException("Invalid input parameters");
+    }
+
+    $deltaRequest = false;
+    $knownNotams = [];
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $maxBodySize = 1048576; // 1MB limit
+        if (isset($_SERVER['CONTENT_LENGTH']) && (int)$_SERVER['CONTENT_LENGTH'] > $maxBodySize) {
+            throw new InvalidArgumentException("Request body too large");
+        }
+        $rawBody = stream_get_contents(fopen('php://input', 'r'), $maxBodySize);
+        if ($rawBody !== false && trim($rawBody) !== '') {
+            $payload = json_decode($rawBody, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new InvalidArgumentException("Invalid JSON in POST body: " . json_last_error_msg());
+            }
+            if (!is_array($payload) || !isset($payload['known']) || !is_array($payload['known'])) {
+                throw new InvalidArgumentException("POST body must contain a 'known' array for delta mode");
+            }
+            $known = $payload['known'];
+            $isList = array_keys($known) === range(0, count($known) - 1);
+            if ($isList) {
+                foreach ($known as $entry) {
+                    if (is_array($entry) && isset($entry['id'], $entry['lastUpdated']) && is_string($entry['id']) && is_string($entry['lastUpdated'])) {
+                        $knownNotams[$entry['id']] = $entry['lastUpdated'];
+                    }
+                }
+            } else {
+                foreach ($known as $id => $lastUpdated) {
+                    if (is_string($id) && is_string($lastUpdated)) {
+                        $knownNotams[$id] = $lastUpdated;
+                    }
+                }
+            }
+            if (!empty($knownNotams)) {
+                $deltaRequest = true;
+            } else {
+                throw new InvalidArgumentException("Delta payload contains no valid entries");
+            }
+        }
     }
 
 
@@ -251,6 +311,49 @@ try {
     $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
+    }
+
+    if ($deltaRequest) {
+        $decoded = json_decode($response, true);
+        if (!is_array($decoded) || !isset($decoded['items']) || !is_array($decoded['items'])) {
+            throw new Exception("Failed to decode FAA response for delta mode");
+        }
+
+        $filteredItems = [];
+        $serverIds = [];
+        foreach ($decoded['items'] as $item) {
+            $notam = $item['properties']['coreNOTAMData']['notam'] ?? null;
+            $id = is_array($notam) ? ($notam['id'] ?? null) : null;
+            $lastUpdated = is_array($notam) ? ($notam['lastUpdated'] ?? null) : null;
+
+            if (is_string($id)) {
+                $serverIds[$id] = is_string($lastUpdated) ? $lastUpdated : null;
+            }
+
+            $knownLastUpdated = is_string($id) ? ($knownNotams[$id] ?? null) : null;
+            if (!is_string($id) || !is_string($lastUpdated) || $knownLastUpdated === null || $knownLastUpdated !== $lastUpdated) {
+                $filteredItems[] = $item;
+            }
+        }
+
+        $removedIds = [];
+        foreach ($knownNotams as $id => $lastUpdated) {
+            if (!array_key_exists($id, $serverIds)) {
+                $removedIds[] = $id;
+            }
+        }
+
+        $decoded['items'] = $filteredItems;
+        $decoded['pageNum'] = 1;
+        $decoded['totalPages'] = 1;
+        $decoded['totalCount'] = count($filteredItems);
+        $decoded['delta'] = true;
+        $decoded['removedIds'] = $removedIds;
+
+        $response = json_encode($decoded);
+        if ($response === false) {
+            throw new Exception("Failed to encode delta response");
+        }
     }
 
     // Return data
