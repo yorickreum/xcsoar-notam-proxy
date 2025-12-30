@@ -14,9 +14,6 @@ Required:
 - `locationLatitude` (alias: `lat`) = latitude of search center (decimal point)
 - `locationRadius` (alias: `radius`) = search radius in nautical miles (0-100)
 
-Optional:
-- `pageSize` = number of items per page (default/max 1000)
-
 ## Delta mode (optional)
 
 POST JSON body with known IDs and lastUpdated timestamps:
@@ -29,7 +26,6 @@ Response contains only new/changed items plus `removedIds`.
 ## Response format
 
 Top-level fields mirror the FAA API:
-- `pageSize`
 - `pageNum`
 - `totalCount`
 - `totalPages`

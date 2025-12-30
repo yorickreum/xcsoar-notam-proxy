@@ -22,9 +22,6 @@
 //   a = longitude of the search center (decimal point)
 //   b = latitude of the search center (decimal point)
 //   c = search radius in nautical miles (0-100)
-// Optional:
-//   pageSize=d (default and max 1000)
-//
 // Delta mode (POST JSON):
 //   {"known": {"NOTAM_ID": "lastUpdated", "NOTAM_ID_2": "lastUpdated"}}
 // Response includes only new/changed items plus "removedIds".
@@ -155,7 +152,7 @@ function getAccessToken($pdo, $authUrl, $clientId, $clientSecret) {
     return $data['access_token'];
 }
 
-function normalizeNmsNotamResponse($response, $pageSize, $responseFormat) {
+function normalizeNmsNotamResponse($response, $responseFormat) {
     $decoded = json_decode($response, true);
     if ($decoded === null) {
         throw new Exception("Failed to decode JSON response from FAA NMS API");
@@ -189,7 +186,6 @@ function normalizeNmsNotamResponse($response, $pageSize, $responseFormat) {
     }
 
     $normalized = [
-        'pageSize' => $pageSize,
         'pageNum' => 1,
         'totalCount' => count($items),
         'totalPages' => 1,
@@ -205,9 +201,9 @@ function normalizeNmsNotamResponse($response, $pageSize, $responseFormat) {
 }
 
 // Function to get cached data or fetch from API
-function getCachedOrFreshData($pdo, $url, $headers, $pageSize, $responseFormat, $cacheTime = 3600) {
+function getCachedOrFreshData($pdo, $url, $headers, $responseFormat, $cacheTime = 3600) {
     // Generate a unique cache key based on the URL and response format
-    $cacheKey = 'notam_' . md5($url . '|pageSize=' . $pageSize . '|format=' . $responseFormat);
+    $cacheKey = 'notam_' . md5($url . '|format=' . $responseFormat);
 
     // Try to fetch from cache
     $stmt = $pdo->prepare("SELECT cache_value FROM notam_cache WHERE cache_key = ? AND expiration > NOW()");
@@ -223,7 +219,7 @@ function getCachedOrFreshData($pdo, $url, $headers, $pageSize, $responseFormat, 
     }
 
     // If not in cache or expired, fetch from API
-    $response = getNotamsFromFaa($url, $headers, $pageSize, $responseFormat);
+    $response = getNotamsFromFaa($url, $headers, $responseFormat);
 
     // Store in cache
     $stmt = $pdo->prepare("INSERT INTO notam_cache (cache_key, cache_value, expiration) 
@@ -236,7 +232,7 @@ function getCachedOrFreshData($pdo, $url, $headers, $pageSize, $responseFormat, 
     return $response;
 }
 
-function getNotamsFromFaa($url, $headers, $pageSize, $responseFormat) {
+function getNotamsFromFaa($url, $headers, $responseFormat) {
     $opts = [
         'http' => [
             'method' => 'GET',
@@ -259,7 +255,7 @@ function getNotamsFromFaa($url, $headers, $pageSize, $responseFormat) {
         throw new Exception($error_message);
     }
 
-    return normalizeNmsNotamResponse($response, $pageSize, $responseFormat);
+    return normalizeNmsNotamResponse($response, $responseFormat);
 }
 
 
@@ -294,11 +290,19 @@ function isValidRadius($input) {
     return is_numeric($input) && $input >= 0 && $input <= 100;
 }
 
-function isValidPageSize($input) {
-    // Check if input is numeric and within the range
-    return is_numeric($input) && $input > 0 && $input <= 1000 && intval($input) == $input;
+function sendErrorResponse($statusCode, $exception) {
+    http_response_code($statusCode);
+    $appEnv = getenv('APP_ENV') ?: 'production';
+    $isProduction = $appEnv === 'production';
+    if ($isProduction) {
+        $errorMessage = $statusCode === 400 ? "Invalid request" : "Internal server error";
+    } else {
+        $errorMessage = $exception->getMessage();
+    }
+    echo json_encode(["error" => $errorMessage]);
+    error_log($exception->getMessage());
+    exit();
 }
-
 
 try {
     $pdo = getDbConnection();
@@ -316,11 +320,9 @@ try {
     if ($radius === null || $radius === false) {
         $radius = filter_input(INPUT_GET, 'radius', FILTER_VALIDATE_FLOAT);
     }
-    $pageSize = filter_input(INPUT_GET, 'pageSize', FILTER_VALIDATE_INT) ?: 1000;
-
     if ($latitude === null || $latitude === false || $longitude === null || $longitude === false ||
         $radius === null || $radius === false || !isValidLongitude($longitude) || !isValidLatitude($latitude) ||
-        !isValidRadius($radius) || !isValidPageSize($pageSize)) {
+        !isValidRadius($radius)) {
       throw new InvalidArgumentException("Invalid input parameters");
     }
 
@@ -394,7 +396,7 @@ try {
                "Accept: application/json\r\n";
 
     // Get data (cached or fresh)
-    $response = getCachedOrFreshData($pdo, $url, $headers, $pageSize, $responseFormat);
+    $response = getCachedOrFreshData($pdo, $url, $headers, $responseFormat);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
@@ -450,21 +452,9 @@ try {
     echo $response;
 
 } catch (InvalidArgumentException $e) {
-    http_response_code(400);
-    $appEnv = getenv('APP_ENV') ?: 'production';
-    $isProduction = $appEnv === 'production';
-    $errorMessage = $isProduction ? "Invalid request" : $e->getMessage();
-    echo json_encode(["error" => $errorMessage]);
-    // Log the error
-    error_log($e->getMessage());
+    sendErrorResponse(400, $e);
 } catch (Exception $e) {
-    http_response_code(500);
-    $appEnv = getenv('APP_ENV') ?: 'production';
-    $isProduction = $appEnv === 'production';
-    $errorMessage = $isProduction ? "Internal server error" : $e->getMessage();
-    echo json_encode(["error" => $errorMessage]);
-    // Log the error
-    error_log($e->getMessage());
+    sendErrorResponse(500, $e);
 }
 
 ?>
