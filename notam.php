@@ -21,7 +21,7 @@
 // Required:
 //   a = longitude of the search center (decimal point)
 //   b = latitude of the search center (decimal point)
-//   c = search radius [units?]
+//   c = search radius in nautical miles (0-100)
 // Optional:
 //   pageSize=d (default and max 1000)
 //
@@ -50,46 +50,164 @@ function getDbConnection() {
     }
 }
 
-// Function to clean up old cache entries and aggregate metrics
-function performMaintenance($pdo) {
-    // Delete expired cache entries
+function purgeExpiredCache($pdo) {
     $stmt = $pdo->prepare("DELETE FROM notam_cache WHERE expiration < NOW()");
-    $stmt->execute();
-
-    // Aggregate metrics older than 30 days
-    $stmt = $pdo->prepare("
-        INSERT INTO cache_metrics_monthly (year, month, metric, count)
-        SELECT YEAR(date), MONTH(date), metric, SUM(count)
-        FROM cache_metrics
-        WHERE date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-        GROUP BY YEAR(date), MONTH(date), metric
-        ON DUPLICATE KEY UPDATE count = count + VALUES(count)
-    ");
-    $stmt->execute();
-
-    // Delete aggregated daily metrics
-    $stmt = $pdo->prepare("DELETE FROM cache_metrics WHERE date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)");
     $stmt->execute();
 }
 
-// Log cache metrics
-function logCacheMetrics($pdo, $isHit) {
-    $metric = $isHit ? 'hit' : 'miss';
-    $stmt = $pdo->prepare("INSERT INTO cache_metrics (metric, count, date) 
-                           VALUES (?, 1, CURDATE())
-                           ON DUPLICATE KEY UPDATE count = count + 1");
-    $stmt->execute([$metric]);
+function httpRequest($url, $opts) {
+    $httpOpts = isset($opts['http']) && is_array($opts['http']) ? $opts['http'] : [];
+    $method = strtoupper($httpOpts['method'] ?? 'GET');
+    $headerStr = $httpOpts['header'] ?? '';
+    $content = $httpOpts['content'] ?? null;
+    $timeout = $httpOpts['timeout'] ?? 30;
 
-    // Perform maintenance operations occasionally (e.g., 1% of the time)
-    if (rand(1, 100) == 1) {
-        performMaintenance($pdo);
+    if (!function_exists('curl_init')) {
+        return [false, 0, 'cURL extension not available'];
     }
+
+    $headers = [];
+    if (is_string($headerStr) && $headerStr !== '') {
+        foreach (preg_split("/\r\n|\n|\r/", $headerStr) as $line) {
+            if ($line !== '') {
+                $headers[] = $line;
+            }
+        }
+    }
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, (int)$timeout);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+    if (!empty($headers)) {
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    }
+    if ($content !== null && $content !== '' && in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $content);
+    }
+
+    $response = curl_exec($ch);
+    $status_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error_message = null;
+    if ($response === false) {
+        $error_message = curl_error($ch);
+    }
+    curl_close($ch);
+
+    return [$response, $status_code, $error_message];
+}
+
+function getAccessToken($pdo, $authUrl, $clientId, $clientSecret) {
+    if (!$clientId || !$clientSecret) {
+        throw new InvalidArgumentException("Missing FAA credentials");
+    }
+
+    $cacheKey = 'faa_token_' . md5($authUrl . '|' . $clientId);
+    $stmt = $pdo->prepare("SELECT cache_value FROM notam_cache WHERE cache_key = ? AND expiration > NOW()");
+    $stmt->execute([$cacheKey]);
+    $result = $stmt->fetch();
+
+    if ($result) {
+        return $result['cache_value'];
+    }
+
+    $basicAuth = base64_encode($clientId . ':' . $clientSecret);
+    $opts = [
+        'http' => [
+            'method' => 'POST',
+            'header' => "Content-Type: application/x-www-form-urlencoded\r\n" .
+                        "Authorization: Basic $basicAuth\r\n",
+            'content' => http_build_query(['grant_type' => 'client_credentials']),
+            'timeout' => 30,
+        ],
+    ];
+
+    [$response, $status_code, $request_error] = httpRequest($authUrl, $opts);
+    if ($response === false || $status_code < 200 || $status_code >= 300) {
+        $error_message = "Failed to get FAA bearer token. Status code: $status_code";
+        if ($request_error !== null && $request_error !== '') {
+            $error_message .= " Error: $request_error";
+        }
+        if ($status_code >= 500) {
+            error_log("Server error when accessing FAA auth: $status_code");
+        } elseif ($status_code == 401) {
+            error_log("Unauthorized when accessing FAA auth");
+        }
+        throw new Exception($error_message);
+    }
+
+    $data = json_decode($response, true);
+    if (!is_array($data) || empty($data['access_token'])) {
+        throw new Exception("Failed to decode FAA auth response");
+    }
+
+    $expiresIn = isset($data['expires_in']) ? (int)$data['expires_in'] : 1800;
+    $ttl = max(60, $expiresIn - 30);
+
+    $stmt = $pdo->prepare("INSERT INTO notam_cache (cache_key, cache_value, expiration) 
+                           VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? SECOND))
+                           ON DUPLICATE KEY UPDATE 
+                           cache_value = VALUES(cache_value), 
+                           expiration = VALUES(expiration)");
+    $stmt->execute([$cacheKey, $data['access_token'], $ttl]);
+
+    return $data['access_token'];
+}
+
+function normalizeNmsNotamResponse($response, $pageSize, $responseFormat) {
+    $decoded = json_decode($response, true);
+    if ($decoded === null) {
+        throw new Exception("Failed to decode JSON response from FAA NMS API");
+    }
+
+    if (($decoded['status'] ?? null) !== 'Success') {
+        $errorDetails = '';
+        if (isset($decoded['errors']) && is_array($decoded['errors']) && !empty($decoded['errors'])) {
+            $errorDetails = ': ' . json_encode($decoded['errors']);
+        }
+        throw new Exception("FAA NMS API returned failure{$errorDetails}");
+    }
+
+    $data = $decoded['data'] ?? null;
+    if (!is_array($data)) {
+        throw new Exception("Missing data in FAA NMS response");
+    }
+
+    $formatKey = strtolower($responseFormat);
+    $items = [];
+    if ($formatKey === 'geojson' && isset($data['geojson']) && is_array($data['geojson'])) {
+        $items = $data['geojson'];
+    } elseif ($formatKey === 'aixm' && isset($data['aixm']) && is_array($data['aixm'])) {
+        $items = $data['aixm'];
+    } elseif (isset($data['geojson']) && is_array($data['geojson'])) {
+        $items = $data['geojson'];
+    } elseif (isset($data['aixm']) && is_array($data['aixm'])) {
+        $items = $data['aixm'];
+    } else {
+        throw new Exception("FAA NMS response missing NOTAM data");
+    }
+
+    $normalized = [
+        'pageSize' => $pageSize,
+        'pageNum' => 1,
+        'totalCount' => count($items),
+        'totalPages' => 1,
+        'items' => $items,
+    ];
+
+    $normalizedJson = json_encode($normalized);
+    if ($normalizedJson === false) {
+        throw new Exception("Failed to encode normalized NOTAM response");
+    }
+
+    return $normalizedJson;
 }
 
 // Function to get cached data or fetch from API
-function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
-    // Generate a unique cache key based on the URL
-    $cacheKey = 'notam_' . md5($url);
+function getCachedOrFreshData($pdo, $url, $headers, $pageSize, $responseFormat, $cacheTime = 3600) {
+    // Generate a unique cache key based on the URL and response format
+    $cacheKey = 'notam_' . md5($url . '|pageSize=' . $pageSize . '|format=' . $responseFormat);
 
     // Try to fetch from cache
     $stmt = $pdo->prepare("SELECT cache_value FROM notam_cache WHERE cache_key = ? AND expiration > NOW()");
@@ -97,24 +215,15 @@ function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     $result = $stmt->fetch();
 
     if ($result) {
-        // Data found in cache
-        logCacheMetrics($pdo, true); // Cache hit
         return $result['cache_value'];
     }
 
-    logCacheMetrics($pdo, false); // Cache miss
+    if (rand(1, 100) == 1) {
+        purgeExpiredCache($pdo);
+    }
 
     // If not in cache or expired, fetch from API
-    $response = getNotamsFromFaa($url, $opts, $pageSize);
-    if ($response === false) {
-        $error_message = "Failed to get data from FAA API. Status code: $status_code";
-        if ($status_code >= 500) {
-            error_log("Server error when accessing FAA API: $status_code");
-        } elseif ($status_code == 404) {
-            error_log("Resource not found on FAA API: $url");
-        }
-        throw new Exception($error_message);
-    }
+    $response = getNotamsFromFaa($url, $headers, $pageSize, $responseFormat);
 
     // Store in cache
     $stmt = $pdo->prepare("INSERT INTO notam_cache (cache_key, cache_value, expiration) 
@@ -127,67 +236,30 @@ function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     return $response;
 }
 
-function getNotamsFromFaa($url, $opts, $pageSize){
-    $allItems = [];
-    $pageNum = 1;
-    $hasMorePages = true;
-
-    while ($hasMorePages) {
-        $paginatedUrl = $url . '&pageNum=' . $pageNum;
-
-        // Make the request
-        $context = stream_context_create($opts);
-        $response = @file_get_contents($paginatedUrl, false, $context);
-
-        // Get the status code
-        $status_code = 0;
-        if (isset($http_response_header[0])) {
-            preg_match('/\d{3}/', $http_response_header[0], $matches);
-            $status_code = intval($matches[0]);
-        }
-
-        // Handle any error in the response
-        if ($response === false || $status_code < 200 || $status_code >= 300) {
-            $error_message = "Failed to get data from FAA API. Status code: $status_code";
-            if ($status_code >= 500) {
-                error_log("Server error when accessing FAA API: $status_code");
-            } elseif ($status_code == 404) {
-                error_log("Resource not found on FAA API: $paginatedUrl");
-            }
-            throw new Exception($error_message);
-        }
-
-        // Decode the JSON response
-        $data = json_decode($response, true);
-        if ($data === null) {
-            throw new Exception("Failed to decode JSON response from FAA API");
-        }
-
-        // Append the items to the allItems array
-        if (isset($data['items'])) {
-            $allItems = array_merge($allItems, $data['items']);
-        }
-
-        // Check if there are more pages
-        if (isset($data['pageNum']) && isset($data['totalPages'])) {
-            $hasMorePages = $data['pageNum'] < $data['totalPages'];
-            $pageNum++; // Move to the next page
-        } else {
-            // If the pagination info is missing, stop the loop
-            $hasMorePages = false;
-        }
-    }
-
-    // Construct the final response
-    $finalResponse = [
-        'pageSize' => $pageSize,
-        'pageNum' => 1, // Since we're combining all pages, set the current page to 1
-        'totalCount' => sizeof($allItems),
-        'totalPages' => 1, // Since all data is combined into one response, totalPages is 1
-        'items' => $allItems
+function getNotamsFromFaa($url, $headers, $pageSize, $responseFormat) {
+    $opts = [
+        'http' => [
+            'method' => 'GET',
+            'header' => $headers,
+            'timeout' => 30,
+        ],
     ];
 
-    return json_encode($finalResponse);
+    [$response, $status_code, $request_error] = httpRequest($url, $opts);
+    if ($response === false || $status_code < 200 || $status_code >= 300) {
+        $error_message = "Failed to get data from FAA NMS API. Status code: $status_code";
+        if ($request_error !== null && $request_error !== '') {
+            $error_message .= " Error: $request_error";
+        }
+        if ($status_code >= 500) {
+            error_log("Server error when accessing FAA NMS API: $status_code");
+        } elseif ($status_code == 404) {
+            error_log("Resource not found on FAA NMS API: $url");
+        }
+        throw new Exception($error_message);
+    }
+
+    return normalizeNmsNotamResponse($response, $pageSize, $responseFormat);
 }
 
 
@@ -219,7 +291,7 @@ function isValidDegree($input) {
 
 function isValidRadius($input) {
     // Check if input is numeric and within the range
-    return is_numeric($input) && $input > 0 && $input < 500 && intval($input) == $input;
+    return is_numeric($input) && $input >= 0 && $input <= 100;
 }
 
 function isValidPageSize($input) {
@@ -240,13 +312,15 @@ try {
     if ($latitude === null || $latitude === false) {
         $latitude = filter_input(INPUT_GET, 'lat', FILTER_VALIDATE_FLOAT);
     }
-    $radius = filter_input(INPUT_GET, 'locationRadius', FILTER_VALIDATE_INT);
+    $radius = filter_input(INPUT_GET, 'locationRadius', FILTER_VALIDATE_FLOAT);
     if ($radius === null || $radius === false) {
-        $radius = filter_input(INPUT_GET, 'radius', FILTER_VALIDATE_INT);
+        $radius = filter_input(INPUT_GET, 'radius', FILTER_VALIDATE_FLOAT);
     }
     $pageSize = filter_input(INPUT_GET, 'pageSize', FILTER_VALIDATE_INT) ?: 1000;
 
-    if (!isset($latitude) || !isset($longitude) || !$radius || !isValidLongitude($longitude) || !isValidLatitude($latitude) || !isValidRadius($radius) || !isValidPageSize($pageSize)) {
+    if ($latitude === null || $latitude === false || $longitude === null || $longitude === false ||
+        $radius === null || $radius === false || !isValidLongitude($longitude) || !isValidLatitude($latitude) ||
+        !isValidRadius($radius) || !isValidPageSize($pageSize)) {
       throw new InvalidArgumentException("Invalid input parameters");
     }
 
@@ -257,7 +331,12 @@ try {
         if (isset($_SERVER['CONTENT_LENGTH']) && (int)$_SERVER['CONTENT_LENGTH'] > $maxBodySize) {
             throw new InvalidArgumentException("Request body too large");
         }
-        $rawBody = stream_get_contents(fopen('php://input', 'r'), $maxBodySize);
+        $inputStream = fopen('php://input', 'r');
+        if ($inputStream === false) {
+            throw new Exception("Failed to read request body");
+        }
+        $rawBody = stream_get_contents($inputStream, $maxBodySize);
+        fclose($inputStream);
         if ($rawBody !== false && trim($rawBody) !== '') {
             $payload = json_decode($rawBody, true);
             if (json_last_error() !== JSON_ERROR_NONE) {
@@ -290,30 +369,40 @@ try {
     }
 
 
+    $responseFormat = getenv('NMS_RESPONSE_FORMAT') ?: 'GEOJSON';
+    $responseFormat = strtoupper(trim($responseFormat));
+    if ($responseFormat !== 'GEOJSON' && $responseFormat !== 'AIXM') {
+        throw new InvalidArgumentException("Invalid NMS response format");
+    }
+
     // Build request
-    $url = 'https://external-api.faa.gov/notamapi/v1/notams?'
-    . 'locationLongitude=' . $longitude
-    . '&locationLatitude=' . $latitude
-    . '&locationRadius=' . $radius
-    . '&pageSize=' . $pageSize;
+    $baseUrl = getenv('FAA_API_BASE') ?: 'https://api-nms.aim.faa.gov/nmsapi';
+    $authUrl = getenv('FAA_AUTH_URL') ?: 'https://api-nms.aim.faa.gov/v1/auth/token';
+    $query = http_build_query([
+        'longitude' => $longitude,
+        'latitude' => $latitude,
+        'radius' => $radius,
+    ]);
+    $url = rtrim($baseUrl, '/') . '/v1/notams?' . $query;
 
-    $FAA_KEY = getenv('FAA_KEY');
-    $FAA_ID  = getenv('FAA_ID');
+    $FAA_ID = getenv('FAA_ID');
+    $FAA_SECRET = getenv('FAA_SECRET');
+    $token = getAccessToken($pdo, $authUrl, $FAA_ID, $FAA_SECRET);
 
-    $opts = array(
-        'http' => array(
-            'header' => "client_id: $FAA_ID\r\n" .
-                        "client_secret: $FAA_KEY\r\n"
-        )
-    );
+    $headers = "Authorization: Bearer $token\r\n" .
+               "nmsResponseFormat: $responseFormat\r\n" .
+               "Accept: application/json\r\n";
 
     // Get data (cached or fresh)
-    $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
+    $response = getCachedOrFreshData($pdo, $url, $headers, $pageSize, $responseFormat);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
 
     if ($deltaRequest) {
+        if ($responseFormat !== 'GEOJSON') {
+            throw new InvalidArgumentException("Delta mode requires GEOJSON response format");
+        }
         $decoded = json_decode($response, true);
         if (!is_array($decoded) || !isset($decoded['items']) || !is_array($decoded['items'])) {
             throw new Exception("Failed to decode FAA response for delta mode");
@@ -360,9 +449,20 @@ try {
     header('Content-Type: application/json');
     echo $response;
 
+} catch (InvalidArgumentException $e) {
+    http_response_code(400);
+    $appEnv = getenv('APP_ENV') ?: 'production';
+    $isProduction = $appEnv === 'production';
+    $errorMessage = $isProduction ? "Invalid request" : $e->getMessage();
+    echo json_encode(["error" => $errorMessage]);
+    // Log the error
+    error_log($e->getMessage());
 } catch (Exception $e) {
     http_response_code(500);
-    echo json_encode(["error" => $e->getMessage()]);
+    $appEnv = getenv('APP_ENV') ?: 'production';
+    $isProduction = $appEnv === 'production';
+    $errorMessage = $isProduction ? "Internal server error" : $e->getMessage();
+    echo json_encode(["error" => $errorMessage]);
     // Log the error
     error_log($e->getMessage());
 }

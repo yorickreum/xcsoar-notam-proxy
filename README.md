@@ -12,7 +12,7 @@ GET:
 Required:
 - `locationLongitude` (alias: `lon`) = longitude of search center (decimal point)
 - `locationLatitude` (alias: `lat`) = latitude of search center (decimal point)
-- `locationRadius` (alias: `radius`) = search radius [units?]
+- `locationRadius` (alias: `radius`) = search radius in nautical miles (0-100)
 
 Optional:
 - `pageSize` = number of items per page (default/max 1000)
@@ -46,4 +46,25 @@ Delta mode adds:
 - `DB_USER`
 - `DB_PASS`
 - `FAA_ID`
-- `FAA_KEY`
+- `FAA_SECRET`
+- `FAA_API_BASE` (default: `https://api-nms.aim.faa.gov/nmsapi`)
+- `FAA_AUTH_URL` (default: `https://api-nms.aim.faa.gov/v1/auth/token`)
+- `NMS_RESPONSE_FORMAT` (`GEOJSON` or `AIXM`, default: `GEOJSON`)
+- `APP_ENV` (`production` by default; set to `debug` to expose error details)
+
+Apache users can copy `.htaccess.example` to `.htaccess` and fill in real values.
++**Do not commit `.htaccess` with real credentials.**
+
+## Database schema
+
+Run this in the target database defined by `DB_NAME`:
+
+```sql
+CREATE TABLE notam_cache (
+  cache_key VARCHAR(128) NOT NULL,
+  cache_value LONGTEXT NOT NULL,
+  expiration DATETIME NOT NULL,
+  PRIMARY KEY (cache_key),
+  KEY idx_expiration (expiration)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```

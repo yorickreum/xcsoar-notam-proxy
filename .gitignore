@@ -2,5 +2,7 @@
 .vscode/sftp.json
 .env
 .htaccess
+# Others
 .DS_Store
 tmp/
+faa-doc/

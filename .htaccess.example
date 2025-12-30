@@ -1,0 +1,25 @@
+# WARNING: This is a template file. NEVER commit real credentials.
+# After copying to .htaccess, fill in real values and ensure this file is:
+#  1. Never committed to version control
+#  2. Protected with appropriate file permissions (e.g., chmod 600)
+#  3. Not world-readable on shared systems
+
+# notam.php
+
+# Environment
+SetEnv APP_ENV production
+
+# Database credentials
+SetEnv DB_SERVER localhost
+SetEnv DB_NAME xcsoar_notam
+SetEnv DB_USER notam
+SetEnv DB_PASS your_db_password
+
+# FAA NMS API config
+SetEnv FAA_API_BASE https://api-staging.cgifederal-aim.com/nmsapi
+SetEnv FAA_AUTH_URL https://api-staging.cgifederal-aim.com/v1/auth/token
+SetEnv NMS_RESPONSE_FORMAT GEOJSON
+
+# FAA credentials
+SetEnv FAA_ID your_faa_client_id
+SetEnv FAA_SECRET your_faa_client_secret
